@@ -12,6 +12,11 @@ workspace = true
 name = "eval-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "zed-acp-server"
+path = "src/acp_server.rs"
+
+
 [dependencies]
 acp_thread.workspace = true
 agent.workspace = true
