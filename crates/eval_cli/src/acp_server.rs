@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use acp_thread::{
@@ -22,14 +22,14 @@ use agent::{NativeAgent, NativeAgentConnection, Templates, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use clap::Parser;
-use futures::channel::mpsc;
 use futures::StreamExt;
+use futures::channel::mpsc;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Subscription, UpdateGlobal as _};
 use language_model::{ConfiguredModel, LanguageModelRegistry, SelectedModel};
 use project::Project;
 use release_channel::{AppCommitSha, AppVersion};
 use reqwest_client::ReqwestClient;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use settings::SettingsStore;
 use util::path_list::PathList;
 
@@ -52,6 +52,10 @@ struct Args {
     /// Model identifier to select (e.g. anthropic/claude-3-7-sonnet)
     #[arg(long)]
     model: Option<String>,
+
+    /// Disable native delegation, with an optional read-only tool profile.
+    #[arg(long, value_parser = ["parent", "review", "edit"])]
+    worker_mode: Option<String>,
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -126,6 +130,7 @@ struct ServerState {
     app_state: Arc<AgentCliAppState>,
     default_worktree: Option<PathBuf>,
     default_model: Option<String>,
+    worker_mode: Option<String>,
     model_ready: bool,
     sessions: HashMap<String, SessionEntry>,
     pending_permissions: HashMap<String, PendingPermission>,
@@ -142,6 +147,7 @@ impl ServerState {
             app_state,
             default_worktree,
             default_model,
+            worker_mode: None,
             model_ready: false,
             sessions: HashMap::new(),
             pending_permissions: HashMap::new(),
@@ -157,7 +163,13 @@ impl ServerState {
         cx: &mut App,
     ) {
         match event {
-            AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
+            // `AcpThread` flushes its buffered streaming Markdown immediately
+            // before emitting `Stopped`. The flush updates the Markdown entity
+            // without another `EntryUpdated`, so inspect the entries here or
+            // the final tail never reaches ACP clients.
+            AcpThreadEvent::NewEntry
+            | AcpThreadEvent::EntryUpdated(_)
+            | AcpThreadEvent::Stopped(_) => {
                 let Some(session) = self.sessions.get_mut(session_id) else {
                     return;
                 };
@@ -169,7 +181,7 @@ impl ServerState {
                         AgentThreadEntry::AssistantMessage(msg) => {
                             for (chunk_ix, chunk) in msg.chunks.iter().enumerate() {
                                 match chunk {
-                                    AssistantMessageChunk::Message { block, .. } => {
+                                    AssistantMessageChunk::Message { block, id } => {
                                         let markdown = block.to_markdown(cx);
                                         let emitted = session
                                             .emitted_chunk_lengths
@@ -184,6 +196,7 @@ impl ServerState {
                                                     "sessionId": session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_message_chunk",
+                                                        "messageId": id.as_ref().map(ToString::to_string),
                                                         "content": {
                                                             "type": "text",
                                                             "text": delta
@@ -193,7 +206,7 @@ impl ServerState {
                                             );
                                         }
                                     }
-                                    AssistantMessageChunk::Thought { block, .. } => {
+                                    AssistantMessageChunk::Thought { block, id } => {
                                         let markdown = block.to_markdown(cx);
                                         let emitted = session
                                             .emitted_chunk_lengths
@@ -208,8 +221,9 @@ impl ServerState {
                                                     "sessionId": session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_thought_chunk",
+                                                        "messageId": id.as_ref().map(ToString::to_string),
                                                         "content": {
-                                                            "type": "thought",
+                                                            "type": "text",
                                                             "text": delta
                                                         }
                                                     }
@@ -295,12 +309,14 @@ impl ServerState {
                     if let ToolCallStatus::WaitingForConfirmation { options, .. } = &call.status {
                         let acp_options = match options {
                             PermissionOptions::Flat(opts) => opts.clone(),
-                            PermissionOptions::Dropdown(choices) => {
-                                choices.iter().flat_map(|c| [c.allow.clone(), c.deny.clone()]).collect()
-                            }
-                            PermissionOptions::DropdownWithPatterns { choices, .. } => {
-                                choices.iter().flat_map(|c| [c.allow.clone(), c.deny.clone()]).collect()
-                            }
+                            PermissionOptions::Dropdown(choices) => choices
+                                .iter()
+                                .flat_map(|c| [c.allow.clone(), c.deny.clone()])
+                                .collect(),
+                            PermissionOptions::DropdownWithPatterns { choices, .. } => choices
+                                .iter()
+                                .flat_map(|c| [c.allow.clone(), c.deny.clone()])
+                                .collect(),
                         };
 
                         let options_vec = if acp_options.is_empty() {
@@ -416,10 +432,7 @@ impl ServerState {
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn find_configured_model(
-    selected: &SelectedModel,
-    cx: &App,
-) -> Option<ConfiguredModel> {
+fn find_configured_model(selected: &SelectedModel, cx: &App) -> Option<ConfiguredModel> {
     let registry = LanguageModelRegistry::global(cx);
     let provider = registry.read(cx).provider(&selected.provider)?;
     let model = provider
@@ -494,9 +507,8 @@ fn main() {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    let http_client = Arc::new(
-        ReqwestClient::user_agent(&user_agent).expect("could not start HTTP client"),
-    );
+    let http_client =
+        Arc::new(ReqwestClient::user_agent(&user_agent).expect("could not start HTTP client"));
 
     let app = gpui_platform::headless().with_http_client(http_client);
 
@@ -538,11 +550,29 @@ fn main() {
             }
         }
 
+        if let Some(worker_mode) = &args.worker_mode {
+            let tools = if worker_mode == "review" {
+                vec!["diagnostics", "find_path", "find_references", "go_to_definition", "list_directory", "read_file", "grep", "fetch", "search_web"]
+            } else {
+                vec!["copy_path", "create_directory", "delete_path", "diagnostics", "apply_code_action", "edit_file", "write_file", "fetch", "find_path", "find_references", "get_code_actions", "go_to_definition", "list_directory", "move_path", "rename_symbol", "read_file", "grep", "terminal", "search_web"]
+            };
+            let enabled_tools = tools.into_iter().map(|name| (name, true)).collect::<std::collections::BTreeMap<_, _>>();
+            let settings = json!({ "agent": {
+                "default_profile": "t3-worker",
+                "profiles": { "t3-worker": { "name": "T3 worker", "enable_all_context_servers": false, "tools": enabled_tools } },
+                "tool_permissions": { "default": "confirm" }
+            }, "autosave": "off", "format_on_save": "off" }).to_string();
+            SettingsStore::update_global(cx, |store, cx| store.set_user_settings(&settings, cx).result())
+                .expect("failed to configure T3 worker profile");
+        }
+
         let state = Rc::new(RefCell::new(ServerState::new(
             app_state,
             args.worktree.clone(),
             args.model.clone(),
         )));
+
+        state.borrow_mut().worker_mode = args.worker_mode.clone();
 
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded::<String>();
         std::thread::spawn(move || {
@@ -599,6 +629,7 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         req_id,
                         json!({
                             "protocolVersion": 1,
+                            "_meta": { "t3WorkerPolicy": state.borrow().worker_mode.clone(), "t3ThreadTools": true },
                             "serverInfo": {
                                 "name": "zed-acp-server",
                                 "version": "0.1.0"
@@ -617,7 +648,58 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         .and_then(|c| c.as_str())
                         .map(PathBuf::from)
                         .or_else(|| state.borrow().default_worktree.clone())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        });
+
+                    // Only T3's scoped HTTP server is forwarded. Worker profiles allow
+                    // coordination tools explicitly; other MCP servers stay disabled.
+                    if let Some(server) = params
+                        .and_then(|p| p.get("mcpServers"))
+                        .and_then(Value::as_array)
+                        .and_then(|servers| {
+                            servers.iter().find(|server| {
+                                server.get("name").and_then(Value::as_str) == Some("t3-code")
+                                    && server.get("type").and_then(Value::as_str) == Some("http")
+                            })
+                        })
+                    {
+                        if let Some(url) = server.get("url").and_then(Value::as_str) {
+                            let headers = server
+                                .get("headers")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|header| {
+                                    Some((
+                                        header.get("name")?.as_str()?.to_owned(),
+                                        header.get("value")?.as_str()?.to_owned(),
+                                    ))
+                                })
+                                .collect::<HashMap<_, _>>();
+                            let worker_mode = state.borrow().worker_mode.clone();
+                            let result = cx.update(|cx| SettingsStore::update_global(cx, |store, cx| {
+                                let mut settings = serde_json::to_value(store.raw_user_settings().cloned().unwrap_or_default())?;
+                                settings["context_servers"]["t3-code"] = json!({ "url": url, "headers": headers, "enabled": true, "timeout": 30 });
+                                if let Some(mode) = &worker_mode {
+                                    let names: &[&str] = if mode == "parent" {
+                                        &["start_thread_workflow", "spawn_child", "assign_child", "report_to_parent", "wait_for_children", "read_thread_workflow", "control_thread_workflow", "refresh_coordination_policy", "list_thread_models", "create_thread", "read_thread", "send_message_to_thread", "interrupt_thread"]
+                                    } else { &["report_to_parent", "read_thread_workflow", "read_thread"] };
+                                    let tools = names.iter().map(|name| (name.to_string(), true)).collect::<std::collections::BTreeMap<_, _>>();
+                                    settings["agent"]["profiles"]["t3-worker"]["context_servers"]["t3-code"] = json!({ "tools": tools });
+                                }
+                                store.set_user_settings(&settings.to_string(), cx).result()
+                            }));
+                            if let Err(error) = result {
+                                send_error(
+                                    req_id,
+                                    -32000,
+                                    &format!("Failed to configure T3 thread tools: {error:#}"),
+                                );
+                                return;
+                            }
+                        }
+                    }
 
                     let (app_state, default_model, model_ready) = {
                         let state = state.borrow();
@@ -628,14 +710,14 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         )
                     };
                     if !model_ready {
-                        if let Err(error) = ensure_model_ready(
-                            &app_state,
-                            default_model.as_deref(),
-                            cx,
-                        )
-                        .await
+                        if let Err(error) =
+                            ensure_model_ready(&app_state, default_model.as_deref(), cx).await
                         {
-                            send_error(req_id, -32000, &format!("Failed to prepare model: {error:#}"));
+                            send_error(
+                                req_id,
+                                -32000,
+                                &format!("Failed to prepare model: {error:#}"),
+                            );
                             return;
                         }
                         state.borrow_mut().model_ready = true;
@@ -657,7 +739,8 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         )
                     });
 
-                    let worktree_task = project.update(cx, |p, cx| p.create_worktree(&workdir, true, cx));
+                    let worktree_task =
+                        project.update(cx, |p, cx| p.create_worktree(&workdir, true, cx));
                     let worktree = match worktree_task.await {
                         Ok(w) => w,
                         Err(e) => {
@@ -687,13 +770,21 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
                     let acp_thread = match cx
                         .update(|cx| {
-                            conn_clone.new_session(project_clone, PathList::new(&[&workdir_clone]), cx)
+                            conn_clone.new_session(
+                                project_clone,
+                                PathList::new(&[&workdir_clone]),
+                                cx,
+                            )
                         })
                         .await
                     {
                         Ok(t) => t,
                         Err(e) => {
-                            send_error(req_id, -32000, &format!("Failed to create ACP session: {e}"));
+                            send_error(
+                                req_id,
+                                -32000,
+                                &format!("Failed to create ACP session: {e}"),
+                            );
                             return;
                         }
                     };
@@ -705,9 +796,12 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
                     let subscription: Subscription = cx.update(|cx| {
                         cx.subscribe(&acp_thread, move |thread, event, cx| {
-                            state_for_sub
-                                .borrow_mut()
-                                .on_thread_event(&sess_id_str, &thread, event, cx);
+                            state_for_sub.borrow_mut().on_thread_event(
+                                &sess_id_str,
+                                &thread,
+                                event,
+                                cx,
+                            );
                         })
                     });
                     subscription.detach();
@@ -750,7 +844,10 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
                     let session_thread = {
                         let state_borrow = state.borrow();
-                        state_borrow.sessions.get(session_id).map(|s| s.acp_thread.clone())
+                        state_borrow
+                            .sessions
+                            .get(session_id)
+                            .map(|s| s.acp_thread.clone())
                     };
 
                     let acp_thread = match session_thread {
@@ -766,21 +863,26 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         if let Some(prompt_arr) = prompt_val.as_array() {
                             for item in prompt_arr {
                                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    content_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(text.to_string())));
+                                    content_blocks.push(acp::ContentBlock::Text(
+                                        acp::TextContent::new(text.to_string()),
+                                    ));
                                 }
                             }
                         } else if let Some(text) = prompt_val.as_str() {
-                            content_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(text.to_string())));
+                            content_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+                                text.to_string(),
+                            )));
                         }
                     }
 
                     if content_blocks.is_empty() {
-                        content_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(String::new())));
+                        content_blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+                            String::new(),
+                        )));
                     }
 
-                    let send_future = acp_thread.update(cx, |thread, cx| {
-                        thread.send(content_blocks, cx)
-                    });
+                    let send_future =
+                        acp_thread.update(cx, |thread, cx| thread.send(content_blocks, cx));
 
                     let req_id_clone = req_id.clone();
                     cx.spawn(async move |_cx| {
@@ -809,10 +911,16 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                 }
                 "session/cancel" => {
                     let params = value.get("params");
-                    let session_id = params.and_then(|p| p.get("sessionId")).and_then(|s| s.as_str());
+                    let session_id = params
+                        .and_then(|p| p.get("sessionId"))
+                        .and_then(|s| s.as_str());
 
                     if let Some(session_id) = session_id {
-                        let thread_opt = state.borrow().sessions.get(session_id).map(|s| s.acp_thread.clone());
+                        let thread_opt = state
+                            .borrow()
+                            .sessions
+                            .get(session_id)
+                            .map(|s| s.acp_thread.clone());
                         if let Some(thread) = thread_opt {
                             let _ = thread.update(cx, |t, cx| t.cancel(cx));
                         }
@@ -855,7 +963,10 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
                     let session_thread = {
                         let state_borrow = state.borrow();
-                        state_borrow.sessions.get(session_id).map(|s| s.acp_thread.clone())
+                        state_borrow
+                            .sessions
+                            .get(session_id)
+                            .map(|s| s.acp_thread.clone())
                     };
 
                     let acp_thread = match session_thread {
@@ -866,11 +977,11 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         }
                     };
 
-                    let content_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(command_text))];
+                    let content_blocks =
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(command_text))];
 
-                    let send_future = acp_thread.update(cx, |thread, cx| {
-                        thread.send(content_blocks, cx)
-                    });
+                    let send_future =
+                        acp_thread.update(cx, |thread, cx| thread.send(content_blocks, cx));
 
                     let req_id_clone = req_id.clone();
                     cx.spawn(async move |_cx| {
@@ -904,8 +1015,16 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
         } else {
             // Notification
             if method_name == "session/cancel" {
-                if let Some(session_id) = value.get("params").and_then(|p| p.get("sessionId")).and_then(|s| s.as_str()) {
-                    let thread_opt = state.borrow().sessions.get(session_id).map(|s| s.acp_thread.clone());
+                if let Some(session_id) = value
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                {
+                    let thread_opt = state
+                        .borrow()
+                        .sessions
+                        .get(session_id)
+                        .map(|s| s.acp_thread.clone());
                     if let Some(thread) = thread_opt {
                         let _ = thread.update(cx, |t, cx| t.cancel(cx));
                     }
@@ -921,11 +1040,19 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
         let pending_perm = state.borrow_mut().pending_permissions.remove(&id_str);
         if let Some(pending) = pending_perm {
-            let thread_opt = state.borrow().sessions.get(&pending.session_id).map(|s| s.acp_thread.clone());
+            let thread_opt = state
+                .borrow()
+                .sessions
+                .get(&pending.session_id)
+                .map(|s| s.acp_thread.clone());
             if let Some(thread) = thread_opt {
                 let outcome_obj = value.get("result").and_then(|r| r.get("outcome"));
-                let outcome_type = outcome_obj.and_then(|o| o.get("outcome")).and_then(|s| s.as_str());
-                let selected_option_id = outcome_obj.and_then(|o| o.get("optionId")).and_then(|s| s.as_str());
+                let outcome_type = outcome_obj
+                    .and_then(|o| o.get("outcome"))
+                    .and_then(|s| s.as_str());
+                let selected_option_id = outcome_obj
+                    .and_then(|o| o.get("optionId"))
+                    .and_then(|s| s.as_str());
 
                 if outcome_type == Some("selected") {
                     if let Some(opt_id_str) = selected_option_id {
@@ -963,10 +1090,16 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
         let pending_elicit = state.borrow_mut().pending_elicitations.remove(&id_str);
         if let Some(pending) = pending_elicit {
-            let thread_opt = state.borrow().sessions.get(&pending.session_id).map(|s| s.acp_thread.clone());
+            let thread_opt = state
+                .borrow()
+                .sessions
+                .get(&pending.session_id)
+                .map(|s| s.acp_thread.clone());
             if let Some(thread) = thread_opt {
                 if let Some(result_val) = value.get("result") {
-                    if let Ok(response) = serde_json::from_value::<acp::CreateElicitationResponse>(result_val.clone()) {
+                    if let Ok(response) =
+                        serde_json::from_value::<acp::CreateElicitationResponse>(result_val.clone())
+                    {
                         let _ = thread.update(cx, |t, cx| {
                             t.respond_to_elicitation(&pending.entry_id, response, cx);
                         });
