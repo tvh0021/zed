@@ -683,10 +683,16 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                                 settings["context_servers"]["t3-code"] = json!({ "url": url, "headers": headers, "enabled": true, "timeout": 30 });
                                 if let Some(mode) = &worker_mode {
                                     let names: &[&str] = if mode == "parent" {
-                                        &["start_thread_workflow", "spawn_child", "assign_child", "report_to_parent", "wait_for_children", "read_thread_workflow", "control_thread_workflow", "refresh_coordination_policy", "list_thread_models", "create_thread", "read_thread", "send_message_to_thread", "interrupt_thread"]
-                                    } else { &["report_to_parent", "read_thread_workflow", "read_thread"] };
+                                        &["start_orchestration_layer", "spawn_child", "assign_child", "report_to_parent", "wait_for_children", "read_orchestration_layer", "control_orchestration_layer", "refresh_coordination_policy", "list_thread_models", "create_thread", "read_thread", "send_message_to_thread", "interrupt_thread"]
+                                    } else { &["report_to_parent", "read_orchestration_layer", "read_thread"] };
                                     let tools = names.iter().map(|name| (name.to_string(), true)).collect::<std::collections::BTreeMap<_, _>>();
                                     settings["agent"]["profiles"]["t3-worker"]["context_servers"]["t3-code"] = json!({ "tools": tools });
+                                    if mode != "parent" {
+                                        let permissions = names.iter().map(|name| {
+                                            (format!("mcp:t3-code:{name}"), json!({ "default": "allow" }))
+                                        }).collect::<serde_json::Map<_, _>>();
+                                        settings["agent"]["tool_permissions"]["tools"] = json!(permissions);
+                                    }
                                 }
                                 store.set_user_settings(&settings.to_string(), cx).result()
                             }));
