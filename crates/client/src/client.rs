@@ -882,6 +882,15 @@ impl Client {
         try_provider: bool,
         cx: &AsyncApp,
     ) -> Result<Credentials> {
+        self.sign_in_inner(try_provider, true, cx).await
+    }
+
+    async fn sign_in_inner(
+        self: &Arc<Self>,
+        try_provider: bool,
+        interactive: bool,
+        cx: &AsyncApp,
+    ) -> Result<Credentials> {
         let is_reauthenticating = if self.status().borrow().is_signed_out() {
             self.set_status(Status::Authenticating, cx);
             false
@@ -911,6 +920,11 @@ impl Client {
                     .await
                     .log_err();
             }
+        }
+
+        if credentials.is_none() && !interactive {
+            self.set_status(Status::SignedOut, cx);
+            return Err(anyhow!("Sign in to Zed before refreshing models"));
         }
 
         if credentials.is_none() {
@@ -1033,6 +1047,15 @@ impl Client {
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn sign_in_non_interactive(self: &Arc<Self>, cx: &AsyncApp) -> Result<()> {
+        if self.status().borrow().is_connected() {
+            return Ok(());
+        }
+        self.sign_in_inner(true, false, cx).await?;
+        self.connect_to_cloud(cx);
         Ok(())
     }
 

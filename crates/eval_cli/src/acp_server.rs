@@ -53,6 +53,10 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
+    /// Print the current hosted model catalog as JSON and exit.
+    #[arg(long)]
+    list_models: bool,
+
     /// Disable native delegation, with an optional read-only tool profile.
     #[arg(long, value_parser = ["parent", "review", "edit"])]
     worker_mode: Option<String>,
@@ -514,6 +518,46 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         let app_state = headless::init(cx);
+
+        if args.list_models {
+            cx.spawn(async move |cx| {
+                let result = async {
+                    app_state.client.sign_in_non_interactive(&cx).await?;
+                    let started_at = Instant::now();
+                    loop {
+                        let models = cx.update(|cx| {
+                            LanguageModelRegistry::global(cx)
+                                .read(cx)
+                                .provider(&language_model::ZED_CLOUD_PROVIDER_ID)
+                                .map(|provider| provider.provided_models(cx))
+                                .unwrap_or_default()
+                        });
+                        if !models.is_empty() {
+                            let models = models.iter().map(|model| json!({
+                                "slug": format!("zed.dev/{}", model.id().0),
+                                "name": model.name().0.to_string(),
+                            })).collect::<Vec<_>>();
+                            println!("{}", serde_json::to_string(&models)?);
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        if started_at.elapsed() >= MODEL_DISCOVERY_TIMEOUT {
+                            anyhow::bail!("Timed out discovering Zed hosted models");
+                        }
+                        cx.background_executor().timer(MODEL_DISCOVERY_POLL_INTERVAL).await;
+                    }
+                }.await;
+                let exit_code = match result {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("Failed to list Zed models: {error:#}");
+                        1
+                    }
+                };
+                cx.update(|cx| cx.quit());
+                std::process::exit(exit_code);
+            }).detach();
+            return;
+        }
 
         // Apply strict confirmation approval policy by default (Requirement 7)
         SettingsStore::update_global(cx, |store, cx| {
