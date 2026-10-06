@@ -6051,6 +6051,8 @@ dependencies = [
  "theme_settings",
  "util",
  "watch",
+ "web_search",
+ "web_search_providers",
 ]
 
 [[package]]

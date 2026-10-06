@@ -8,6 +8,7 @@ mod headless;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -69,7 +70,14 @@ fn next_id(prefix: &str) -> String {
     format!("{}_{}", prefix, id)
 }
 
+#[cfg(test)]
+thread_local! {
+    static RPC_MESSAGES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+}
+
 fn send_rpc(msg: &Value) {
+    #[cfg(test)]
+    RPC_MESSAGES.with(|messages| messages.borrow_mut().push(msg.clone()));
     if let Ok(serialized) = serde_json::to_string(msg) {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -98,6 +106,20 @@ fn send_error(id: &Value, code: i64, message: &str) {
     }));
 }
 
+fn prompt_result(outcome: anyhow::Result<Option<acp::PromptResponse>>) -> anyhow::Result<Value> {
+    let stop_reason = match outcome {
+        Ok(Some(response)) => match response.stop_reason {
+            acp::StopReason::EndTurn => "end_turn",
+            acp::StopReason::MaxTokens => "max_tokens",
+            acp::StopReason::Cancelled => "cancelled",
+            _ => "end_turn",
+        },
+        Ok(None) => "end_turn",
+        Err(error) => return Err(error),
+    };
+    Ok(json!({ "stopReason": stop_reason }))
+}
+
 fn send_notification(method: &str, params: Value) {
     send_rpc(&json!({
         "jsonrpc": "2.0",
@@ -109,14 +131,15 @@ fn send_notification(method: &str, params: Value) {
 #[allow(dead_code)]
 struct SessionEntry {
     session_id: String,
+    client_session_id: String,
     project: Entity<Project>,
     connection: Rc<NativeAgentConnection>,
     acp_thread: Entity<AcpThread>,
     workdir: PathBuf,
     // (entry_index, chunk_index) -> emitted text byte length
     emitted_chunk_lengths: HashMap<(usize, usize), usize>,
-    // tool_call_id -> known status
-    emitted_tool_calls: HashMap<acp::ToolCallId, String>,
+    // Keep fingerprints rather than retaining a second copy of tool output.
+    emitted_tool_calls: HashMap<acp::ToolCallId, u64>,
 }
 
 struct PendingPermission {
@@ -166,6 +189,11 @@ impl ServerState {
         event: &AcpThreadEvent,
         cx: &mut App,
     ) {
+        let client_session_id = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.client_session_id.clone())
+            .unwrap_or_else(|| session_id.to_string());
         match event {
             // `AcpThread` flushes its buffered streaming Markdown immediately
             // before emitting `Stopped`. The flush updates the Markdown entity
@@ -181,8 +209,15 @@ impl ServerState {
                 let entries = thread_read.entries();
 
                 for (entry_ix, entry) in entries.iter().enumerate() {
+                    if let AcpThreadEvent::EntryUpdated(updated_ix) = event
+                        && entry_ix != *updated_ix
+                    {
+                        continue;
+                    }
                     match entry {
-                        AgentThreadEntry::AssistantMessage(msg) => {
+                        AgentThreadEntry::AssistantMessage(msg)
+                            if session_id == client_session_id =>
+                        {
                             for (chunk_ix, chunk) in msg.chunks.iter().enumerate() {
                                 match chunk {
                                     AssistantMessageChunk::Message { block, id } => {
@@ -197,7 +232,7 @@ impl ServerState {
                                             send_notification(
                                                 "session/update",
                                                 json!({
-                                                    "sessionId": session_id,
+                                                    "sessionId": client_session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_message_chunk",
                                                         "messageId": id.as_ref().map(ToString::to_string),
@@ -222,7 +257,7 @@ impl ServerState {
                                             send_notification(
                                                 "session/update",
                                                 json!({
-                                                    "sessionId": session_id,
+                                                    "sessionId": client_session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_thought_chunk",
                                                         "messageId": id.as_ref().map(ToString::to_string),
@@ -262,52 +297,57 @@ impl ServerState {
                                 _ => "other",
                             };
 
-                            let title = call.label.read(cx).source().to_string();
-
-                            let prev_status = session.emitted_tool_calls.get(&call.id);
-                            if prev_status.is_none() {
-                                session
-                                    .emitted_tool_calls
-                                    .insert(call.id.clone(), status_str.to_string());
-                                send_notification(
-                                    "session/update",
-                                    json!({
-                                        "sessionId": session_id,
-                                        "update": {
-                                            "sessionUpdate": "tool_call",
-                                            "toolCallId": call.id.to_string(),
-                                            "title": title,
-                                            "kind": kind_str,
-                                            "status": status_str,
-                                            "rawInput": call.raw_input
-                                        }
-                                    }),
-                                );
-                            } else if prev_status.map(|s| s.as_str()) != Some(status_str)
-                                || call.raw_output.is_some()
-                            {
-                                session
-                                    .emitted_tool_calls
-                                    .insert(call.id.clone(), status_str.to_string());
-                                send_notification(
-                                    "session/update",
-                                    json!({
-                                        "sessionId": session_id,
-                                        "update": {
-                                            "sessionUpdate": "tool_call_update",
-                                            "toolCallId": call.id.to_string(),
-                                            "status": status_str,
-                                            "rawOutput": call.raw_output
-                                        }
-                                    }),
-                                );
+                            let mut update = json!({
+                                "toolCallId": client_tool_call_id(session_id, &client_session_id, &call.id),
+                                "title": call.label.read(cx).source(),
+                                "kind": kind_str,
+                                "status": status_str,
+                                "rawInput": call.raw_input,
+                                "rawOutput": call.raw_output,
+                                "locations": call.locations,
+                                "content": call.content.iter().map(|content| json!({
+                                    "type": "content",
+                                    "content": { "type": "text", "text": content.to_markdown(cx) },
+                                })).collect::<Vec<_>>(),
+                            });
+                            if let Some(name) = &call.tool_name {
+                                update["name"] = json!(name.as_ref());
                             }
+                            if let Some(info) = &call.subagent_session_info {
+                                update["_meta"] = json!({ "subagent_session_info": info });
+                            }
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            update.hash(&mut hasher);
+                            let fingerprint = hasher.finish();
+                            let previous = session
+                                .emitted_tool_calls
+                                .insert(call.id.clone(), fingerprint);
+                            if previous == Some(fingerprint) {
+                                continue;
+                            }
+                            update["sessionUpdate"] = json!(if previous.is_none() {
+                                "tool_call"
+                            } else {
+                                "tool_call_update"
+                            });
+                            send_notification(
+                                "session/update",
+                                json!({
+                                    "sessionId": client_session_id,
+                                    "update": update,
+                                }),
+                            );
                         }
                         _ => {}
                     }
                 }
             }
             AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+                if self.pending_permissions.values().any(|pending| {
+                    pending.session_id == session_id && &pending.tool_call_id == tool_call_id
+                }) {
+                    return;
+                }
                 let thread_read = thread.read(cx);
                 if let Some((_, call)) = thread_read.tool_call(tool_call_id) {
                     if let ToolCallStatus::WaitingForConfirmation { options, .. } = &call.status {
@@ -374,9 +414,9 @@ impl ServerState {
                             "id": req_id,
                             "method": "session/request_permission",
                             "params": {
-                                "sessionId": session_id,
+                                "sessionId": client_session_id,
                                 "toolCall": {
-                                    "toolCallId": tool_call_id.to_string(),
+                                    "toolCallId": client_tool_call_id(session_id, &client_session_id, tool_call_id),
                                     "title": title,
                                     "status": "pending",
                                     "rawInput": call.raw_input
@@ -402,12 +442,14 @@ impl ServerState {
                     "id": req_id,
                     "method": "elicitation/create",
                     "params": {
-                        "sessionId": session_id,
+                        "sessionId": client_session_id,
                         "elicitationId": entry_id.0.to_string(),
                     }
                 }));
             }
-            AcpThreadEvent::AvailableCommandsUpdated(commands) => {
+            AcpThreadEvent::AvailableCommandsUpdated(commands)
+                if session_id == client_session_id =>
+            {
                 let cmds_json: Vec<Value> = commands
                     .iter()
                     .map(|cmd| {
@@ -420,7 +462,7 @@ impl ServerState {
                 send_notification(
                     "session/update",
                     json!({
-                        "sessionId": session_id,
+                        "sessionId": client_session_id,
                         "update": {
                             "sessionUpdate": "available_commands_update",
                             "availableCommands": cmds_json
@@ -660,6 +702,131 @@ fn main() {
     });
 }
 
+fn client_tool_call_id(session_id: &str, client_session_id: &str, id: &acp::ToolCallId) -> String {
+    if session_id == client_session_id {
+        id.to_string()
+    } else {
+        format!("{session_id}:{}", id)
+    }
+}
+
+fn subscribe_session(
+    state: &Rc<RefCell<ServerState>>,
+    session_id: &str,
+    thread: &Entity<AcpThread>,
+    cx: &mut App,
+) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    let subscription: Subscription = cx.subscribe(thread, move |thread, event, cx| {
+        state
+            .borrow_mut()
+            .on_thread_event(&session_id, &thread, event, cx);
+        if let AcpThreadEvent::SubagentSpawned(child_id) = event {
+            attach_subagent(&state, &session_id, child_id, cx);
+        }
+    });
+    subscription.detach();
+}
+
+fn attach_subagent(
+    state: &Rc<RefCell<ServerState>>,
+    session_id: &str,
+    child_id: &acp::SessionId,
+    cx: &mut App,
+) {
+    let Some((connection, project, workdir, client_session_id)) =
+        state.borrow().sessions.get(session_id).map(|parent| {
+            (
+                parent.connection.clone(),
+                parent.project.clone(),
+                parent.workdir.clone(),
+                parent.client_session_id.clone(),
+            )
+        })
+    else {
+        return;
+    };
+    if state.borrow().sessions.contains_key(&child_id.to_string()) {
+        return;
+    }
+    let child_task = connection.clone().load_session(
+        child_id.clone(),
+        project.clone(),
+        PathList::new(&[&workdir]),
+        None,
+        cx,
+    );
+    let state = state.clone();
+    cx.spawn(async move |cx| {
+        let child = match child_task.await {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("Failed to attach subagent session: {error:#}");
+                return;
+            }
+        };
+        cx.update(|cx| {
+            let child_id = child.read(cx).session_id().to_string();
+            state.borrow_mut().sessions.insert(
+                child_id.clone(),
+                SessionEntry {
+                    session_id: child_id.clone(),
+                    client_session_id,
+                    project,
+                    connection,
+                    acp_thread: child.clone(),
+                    workdir,
+                    emitted_chunk_lengths: HashMap::new(),
+                    emitted_tool_calls: HashMap::new(),
+                },
+            );
+            subscribe_session(&state, &child_id, &child, cx);
+            // A child may already be waiting before its subscription attaches.
+            state
+                .borrow_mut()
+                .on_thread_event(&child_id, &child, &AcpThreadEvent::NewEntry, cx);
+            let waiting = child
+                .read(cx)
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call)
+                        if matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. }) =>
+                    {
+                        Some(call.id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for id in waiting {
+                state.borrow_mut().on_thread_event(
+                    &child_id,
+                    &child,
+                    &AcpThreadEvent::ToolAuthorizationRequested(id),
+                    cx,
+                );
+            }
+            let descendants = child
+                .read(cx)
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) => call
+                        .subagent_session_info
+                        .as_ref()
+                        .map(|info| info.session_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for descendant in descendants {
+                attach_subagent(&state, &child_id, &descendant, cx);
+            }
+        });
+    })
+    .detach();
+}
+
 async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut AsyncApp) {
     let method = value.get("method").and_then(|m| m.as_str());
     let id = value.get("id");
@@ -841,25 +1008,13 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
 
                     let session_id = acp_thread.read_with(cx, |t, _| t.session_id().to_string());
 
-                    let sess_id_str = session_id.clone();
-                    let state_for_sub = state.clone();
-
-                    let subscription: Subscription = cx.update(|cx| {
-                        cx.subscribe(&acp_thread, move |thread, event, cx| {
-                            state_for_sub.borrow_mut().on_thread_event(
-                                &sess_id_str,
-                                &thread,
-                                event,
-                                cx,
-                            );
-                        })
-                    });
-                    subscription.detach();
+                    cx.update(|cx| subscribe_session(&state, &session_id, &acp_thread, cx));
 
                     state.borrow_mut().sessions.insert(
                         session_id.clone(),
                         SessionEntry {
                             session_id: session_id.clone(),
+                            client_session_id: session_id.clone(),
                             project,
                             connection,
                             acp_thread,
@@ -937,25 +1092,14 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                     let req_id_clone = req_id.clone();
                     cx.spawn(async move |_cx| {
                         let outcome = send_future.await;
-                        let stop_reason = match outcome {
-                            Ok(Some(resp)) => match resp.stop_reason {
-                                acp::StopReason::EndTurn => "end_turn",
-                                acp::StopReason::MaxTokens => "max_tokens",
-                                acp::StopReason::Cancelled => "cancelled",
-                                _ => "end_turn",
-                            },
-                            Ok(None) => "end_turn",
-                            Err(err) => {
-                                eprintln!("Prompt turn finished with error: {err:?}");
-                                "end_turn"
-                            }
-                        };
-                        send_response(
-                            &req_id_clone,
-                            json!({
-                                "stopReason": stop_reason
-                            }),
-                        );
+                        match prompt_result(outcome) {
+                            Ok(result) => send_response(&req_id_clone, result),
+                            Err(error) => send_error(
+                                &req_id_clone,
+                                -32000,
+                                &format!("Prompt failed: {error:#}"),
+                            ),
+                        }
                     })
                     .detach();
                 }
@@ -1036,25 +1180,14 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                     let req_id_clone = req_id.clone();
                     cx.spawn(async move |_cx| {
                         let outcome = send_future.await;
-                        let stop_reason = match outcome {
-                            Ok(Some(resp)) => match resp.stop_reason {
-                                acp::StopReason::EndTurn => "end_turn",
-                                acp::StopReason::MaxTokens => "max_tokens",
-                                acp::StopReason::Cancelled => "cancelled",
-                                _ => "end_turn",
-                            },
-                            Ok(None) => "end_turn",
-                            Err(err) => {
-                                eprintln!("Skill invocation finished with error: {err:?}");
-                                "end_turn"
-                            }
-                        };
-                        send_response(
-                            &req_id_clone,
-                            json!({
-                                "stopReason": stop_reason
-                            }),
-                        );
+                        match prompt_result(outcome) {
+                            Ok(result) => send_response(&req_id_clone, result),
+                            Err(error) => send_error(
+                                &req_id_clone,
+                                -32000,
+                                &format!("Prompt failed: {error:#}"),
+                            ),
+                        }
                     })
                     .detach();
                 }
@@ -1157,5 +1290,294 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_result_tests {
+    use super::*;
+
+    #[test]
+    fn failed_prompt_is_not_reported_as_success() {
+        let result = prompt_result(Err(anyhow::anyhow!("unsupported thinking mode")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn successful_prompt_preserves_stop_reason() {
+        let result = prompt_result(Ok(Some(acp::PromptResponse::new(
+            acp::StopReason::MaxTokens,
+        ))))
+        .unwrap();
+        assert_eq!(result, json!({ "stopReason": "max_tokens" }));
+    }
+    async fn test_session(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Rc<RefCell<ServerState>>, Entity<AcpThread>) {
+        RPC_MESSAGES.with(|messages| messages.borrow_mut().clear());
+        let app_state = headless::tests::init(cx).await;
+        let project = cx.update(|cx| {
+            Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags {
+                    init_worktree_trust: false,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let connection = cx.update(|cx| {
+            let store = cx.new(|cx| ThreadStore::new(cx));
+            Rc::new(NativeAgentConnection(NativeAgent::new(
+                store,
+                Templates::new(),
+                app_state.fs.clone(),
+                cx,
+            )))
+        });
+        let parent = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[] as &[PathBuf]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let parent_id = parent.read_with(cx, |t, _| t.session_id().to_string());
+        let state = Rc::new(RefCell::new(ServerState::new(app_state, None, None)));
+        cx.update(|cx| {
+            state.borrow_mut().sessions.insert(
+                parent_id.clone(),
+                SessionEntry {
+                    session_id: parent_id.clone(),
+                    client_session_id: parent_id.clone(),
+                    project,
+                    connection,
+                    acp_thread: parent.clone(),
+                    workdir: PathBuf::from("/tmp"),
+                    emitted_chunk_lengths: HashMap::new(),
+                    emitted_tool_calls: HashMap::new(),
+                },
+            );
+            subscribe_session(&state, &parent_id, &parent, cx);
+        });
+
+        (state, parent)
+    }
+
+    #[gpui::test]
+    async fn spawned_agent_permissions_reach_the_client(cx: &mut gpui::TestAppContext) {
+        child_permission_roundtrip(cx, false, false).await;
+    }
+
+    #[gpui::test]
+    async fn permissions_pending_before_subagent_attachment_reach_the_client(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        child_permission_roundtrip(cx, true, false).await;
+    }
+
+    #[gpui::test]
+    async fn nested_subagent_permissions_pending_before_attachment_reach_the_client(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        child_permission_roundtrip(cx, true, true).await;
+    }
+
+    async fn child_permission_roundtrip(
+        cx: &mut gpui::TestAppContext,
+        already_waiting: bool,
+        nested: bool,
+    ) {
+        let (state, parent) = test_session(cx).await;
+        let parent_id = parent.read_with(cx, |t, _| t.session_id().to_string());
+        let (connection, project) = state
+            .borrow()
+            .sessions
+            .get(&parent_id)
+            .map(|s| (s.connection.clone(), s.project.clone()))
+            .unwrap();
+        let child = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[] as &[PathBuf]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let child_id = child.read_with(cx, |t, _| t.session_id().clone());
+        let child = if nested {
+            let grandchild = cx
+                .update(|cx| {
+                    connection.clone().new_session(
+                        project.clone(),
+                        PathList::new(&[] as &[PathBuf]),
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            let grandchild_id = grandchild.read_with(cx, |t, _| t.session_id().clone());
+            let mut spawn = acp::ToolCall::new(acp::ToolCallId::new("spawn-child"), "Spawn agent");
+            spawn.meta = Some(acp::Meta::from_iter([(
+                acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                json!({ "session_id": grandchild_id, "message_start_index": 0, "message_end_index": null }),
+            )]));
+            child.update(cx, |t, cx| {
+                t.upsert_tool_call(spawn, cx).unwrap();
+                t.subagent_spawned(grandchild_id, cx);
+            });
+            grandchild
+        } else {
+            child
+        };
+        if !already_waiting {
+            parent.update(cx, |t, cx| t.subagent_spawned(child_id.clone(), cx));
+            cx.run_until_parked();
+        }
+        let authorization = child
+            .update(cx, |t, cx| {
+                t.request_tool_call_authorization(
+                    acp::ToolCallUpdate::new(
+                        acp::ToolCallId::new("child-search"),
+                        acp::ToolCallUpdateFields::new().title("Search the web"),
+                    ),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        acp::PermissionOptionId::new("allow"),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+        if already_waiting {
+            parent.update(cx, |t, cx| t.subagent_spawned(child_id.clone(), cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            state.borrow().pending_permissions.len(),
+            1,
+            "a child tool permission must be forwarded instead of silently stalling"
+        );
+        let request = RPC_MESSAGES.with(|messages| {
+            messages
+                .borrow()
+                .iter()
+                .find(|m| m["method"] == "session/request_permission")
+                .cloned()
+                .unwrap()
+        });
+        assert_eq!(request["params"]["sessionId"], parent_id);
+        process_message(
+            json!({ "jsonrpc": "2.0", "id": request["id"],
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } }
+            }),
+            state.clone(),
+            &mut cx.to_async(),
+        )
+        .await;
+        assert!(matches!(
+            authorization.await,
+            acp_thread::RequestPermissionOutcome::Selected(_)
+        ));
+        assert!(state.borrow().pending_permissions.is_empty());
+    }
+
+    #[gpui::test]
+    async fn streaming_tool_details_are_not_frozen_at_the_first_fragment(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (state, parent) = test_session(cx).await;
+        let id = acp::ToolCallId::new("read-file");
+        parent
+            .update(cx, |t, cx| {
+                t.upsert_tool_call(
+                    acp::ToolCall::new(id.clone(), "Read file")
+                        .raw_input(json!({ "path": "work" })),
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        parent
+            .update(cx, |t, cx| {
+                t.update_tool_call(
+                    acp::ToolCallUpdate::new(
+                        id.clone(),
+                        acp::ToolCallUpdateFields::new()
+                            .raw_input(json!({ "path": "work_utilities" })),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let input = RPC_MESSAGES.with(|messages| {
+            messages
+                .borrow()
+                .iter()
+                .rev()
+                .find(|m| m["params"]["update"]["toolCallId"] == "read-file")
+                .unwrap()["params"]["update"]["rawInput"]
+                .clone()
+        });
+        assert_eq!(input, json!({ "path": "work_utilities" }));
+        parent
+            .update(cx, |t, cx| {
+                t.update_tool_call(
+                    acp::ToolCallUpdate::new(
+                        id.clone(),
+                        acp::ToolCallUpdateFields::new()
+                            .title("Read search.md")
+                            .raw_input(
+                                json!({ "path": "work_utilities/search.md", "start_line": 10 }),
+                            )
+                            .status(acp::ToolCallStatus::Completed)
+                            .raw_output(json!({ "Text": "result" })),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let update = RPC_MESSAGES.with(|messages| {
+            messages
+                .borrow()
+                .iter()
+                .rev()
+                .find(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update")
+                .cloned()
+                .unwrap()
+        });
+        assert_eq!(
+            update["params"]["update"]["rawInput"],
+            json!({ "path": "work_utilities/search.md", "start_line": 10 })
+        );
+        assert_eq!(update["params"]["update"]["title"], "Read search.md");
+        let count = RPC_MESSAGES.with(|messages| messages.borrow().len());
+        cx.update(|cx| {
+            state.borrow_mut().on_thread_event(
+                &parent.read(cx).session_id().to_string(),
+                &parent,
+                &AcpThreadEvent::NewEntry,
+                cx,
+            )
+        });
+        assert_eq!(
+            RPC_MESSAGES.with(|messages| messages.borrow().len()),
+            count,
+            "unrelated entry updates must not resend completed tools"
+        );
     }
 }

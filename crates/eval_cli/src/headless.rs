@@ -110,6 +110,9 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
     language_model::init(cx);
     RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
     language_models::init(user_store.clone(), client.clone(), cx);
+    // Native search_web needs the same provider registry as the editor.
+    web_search::init(cx);
+    web_search_providers::init(client.clone(), user_store.clone(), cx);
     languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
     prompt_store::init(cx);
     terminal_view::init(cx);
@@ -137,4 +140,54 @@ pub fn init(cx: &mut App) -> Arc<AgentCliAppState> {
         fs,
         node_runtime,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) async fn init(
+        cx: &mut gpui::TestAppContext,
+    ) -> std::sync::Arc<super::AgentCliAppState> {
+        static DATA_DIR: std::sync::Once = std::sync::Once::new();
+        DATA_DIR.call_once(|| {
+            paths::set_custom_data_dir(&format!(
+                "/tmp/t3-zed-runtime-tests-{}",
+                std::process::id()
+            ));
+        });
+        cx.executor().allow_parking();
+        let state = cx.update(super::init);
+        let ready = cx.update(|cx| agent::ThreadStore::global(cx).read(cx).reload_task());
+        ready.await;
+        let ready = cx.update(|cx| {
+            agent_ui::thread_metadata_store::ThreadMetadataStore::global(cx)
+                .read(cx)
+                .reload_task()
+        });
+        ready.await;
+        let ready = cx.update(|cx| {
+            agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .reload_task()
+        });
+        ready.await;
+        cx.run_until_parked();
+        let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+        kvp.write_kvp("runtime-test-startup-drained".into(), "1".into())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        state
+    }
+
+    #[gpui::test]
+    async fn headless_runtime_registers_web_search(cx: &mut gpui::TestAppContext) {
+        let _state = init(cx).await;
+        cx.update(|cx| {
+            assert!(
+                web_search::WebSearchRegistry::read_global(cx)
+                    .active_provider()
+                    .is_none()
+            );
+        });
+    }
 }
