@@ -116,6 +116,7 @@ pub struct FakeLanguageModel {
     >,
     forbid_requests: AtomicBool,
     supports_thinking: AtomicBool,
+    effort_levels: Vec<crate::LanguageModelEffortLevel>,
     supports_disabling_thinking: AtomicBool,
     supports_streaming_tools: AtomicBool,
     supports_images: AtomicBool,
@@ -137,6 +138,7 @@ impl Default for FakeLanguageModel {
             current_completion_txs: Mutex::new(Vec::new()),
             forbid_requests: AtomicBool::new(false),
             supports_thinking: AtomicBool::new(false),
+            effort_levels: Vec::new(),
             supports_disabling_thinking: AtomicBool::new(true),
             supports_streaming_tools: AtomicBool::new(false),
             supports_images: AtomicBool::new(false),
@@ -164,6 +166,11 @@ impl FakeLanguageModel {
             supports_thinking: AtomicBool::new(supports_thinking),
             ..Default::default()
         }
+    }
+
+    pub fn with_effort_levels(mut self, levels: Vec<crate::LanguageModelEffortLevel>) -> Self {
+        self.effort_levels = levels;
+        self
     }
 
     pub fn allow_requests(&self) {
@@ -338,6 +345,10 @@ impl LanguageModel for FakeLanguageModel {
 
     fn supports_thinking(&self) -> bool {
         self.supports_thinking.load(SeqCst)
+    }
+
+    fn supported_effort_levels(&self) -> Vec<crate::LanguageModelEffortLevel> {
+        self.effort_levels.clone()
     }
 
     fn supports_disabling_thinking(&self) -> bool {

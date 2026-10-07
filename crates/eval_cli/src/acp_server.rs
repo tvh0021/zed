@@ -533,6 +533,32 @@ async fn ensure_model_ready(
     }
 }
 
+fn effort_config_options(thread: &agent::Thread) -> Vec<Value> {
+    let Some(model) = thread.model() else {
+        return Vec::new();
+    };
+    let levels = model.supported_effort_levels();
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let current = thread.thinking_effort().cloned().or_else(|| {
+        model
+            .default_effort_level()
+            .map(|level| level.value.to_string())
+    });
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    vec![json!({
+        "id": "thinking_effort", "name": "Thinking effort", "category": "thought_level",
+        "type": "select", "currentValue": current,
+        "_meta": { "defaultValue": model.default_effort_level().map(|level| level.value.to_string()) },
+        "options": levels.iter().map(|level| json!({
+            "value": level.value.to_string(), "name": level.name.to_string(),
+        })).collect::<Vec<_>>(),
+    })]
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -578,6 +604,11 @@ fn main() {
                             let models = models.iter().map(|model| json!({
                                 "slug": format!("zed.dev/{}", model.id().0),
                                 "name": model.name().0.to_string(),
+                                "effortLevels": model.supported_effort_levels().iter().map(|level| json!({
+                                    "value": level.value.to_string(),
+                                    "name": level.name.to_string(),
+                                    "isDefault": level.is_default,
+                                })).collect::<Vec<_>>(),
                             })).collect::<Vec<_>>();
                             println!("{}", serde_json::to_string(&models)?);
                             return Ok::<_, anyhow::Error>(());
@@ -1024,12 +1055,126 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         },
                     );
 
+                    let config_options = cx.update(|cx| {
+                        let state = state.borrow();
+                        let session = &state.sessions[&session_id];
+                        session
+                            .connection
+                            .thread(&acp::SessionId::new(session_id.clone()), cx)
+                            .map(|thread| {
+                                thread.update(cx, |thread, cx| {
+                                    if let Some(model) = thread.model().cloned() {
+                                        if !model.supported_effort_levels().is_empty() {
+                                            thread.set_thinking_enabled(true, cx);
+                                            thread.set_thinking_effort(
+                                                model
+                                                    .default_effort_level()
+                                                    .map(|level| level.value.to_string()),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                    effort_config_options(thread)
+                                })
+                            })
+                            .unwrap_or_default()
+                    });
                     send_response(
                         req_id,
-                        json!({
-                            "sessionId": session_id
-                        }),
+                        json!({ "sessionId": session_id, "configOptions": config_options }),
                     );
+                }
+                "session/set_config_option" | "session/set_model" => {
+                    let params = value.get("params").unwrap_or(&Value::Null);
+                    let session_id = params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let result = cx.update(|cx| -> anyhow::Result<Vec<Value>> {
+                        let state = state.borrow();
+                        let session = state
+                            .sessions
+                            .get(session_id)
+                            .context("Session not found")?;
+                        let thread = session
+                            .connection
+                            .thread(&acp::SessionId::new(session_id.to_owned()), cx)
+                            .context("Native thread not found")?;
+                        if method_name == "session/set_model"
+                            || params.get("configId").and_then(Value::as_str) == Some("model")
+                        {
+                            let model_id = params
+                                .get("modelId")
+                                .or_else(|| params.get("value"))
+                                .and_then(Value::as_str)
+                                .context("Missing modelId")?;
+                            let selected = model_id
+                                .parse::<SelectedModel>()
+                                .map_err(|error| anyhow::anyhow!(error))?;
+                            let configured = find_configured_model(&selected, cx)
+                                .context("Model not available")?;
+                            thread.update(cx, |thread, cx| {
+                                let previous = thread.thinking_effort().cloned();
+                                let levels = configured.model.supported_effort_levels();
+                                let effort = previous
+                                    .filter(|value| {
+                                        levels
+                                            .iter()
+                                            .any(|level| level.value.as_ref() == value.as_str())
+                                    })
+                                    .or_else(|| {
+                                        configured
+                                            .model
+                                            .default_effort_level()
+                                            .map(|level| level.value.to_string())
+                                    });
+                                thread
+                                    .set_thinking_enabled(configured.model.supports_thinking(), cx);
+                                thread.set_model(configured.model, cx);
+                                thread.set_thinking_effort(effort, cx);
+                            });
+                        } else {
+                            anyhow::ensure!(
+                                params.get("configId").and_then(Value::as_str)
+                                    == Some("thinking_effort"),
+                                "Unknown configId"
+                            );
+                            let effort = params
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .context("Missing effort")?;
+                            let model = thread.read(cx).model().context("No model selected")?;
+                            anyhow::ensure!(
+                                model
+                                    .supported_effort_levels()
+                                    .iter()
+                                    .any(|level| level.value.as_ref() == effort),
+                                "Unsupported thinking effort"
+                            );
+                            thread.update(cx, |thread, cx| {
+                                thread.set_thinking_enabled(true, cx);
+                                thread.set_thinking_effort(Some(effort.to_owned()), cx);
+                            });
+                        }
+                        Ok(effort_config_options(thread.read(cx)))
+                    });
+                    match result {
+                        Ok(options) => {
+                            send_notification(
+                                "session/update",
+                                json!({ "sessionId": session_id, "update": { "sessionUpdate": "config_option_update", "configOptions": options } }),
+                            );
+                            send_response(
+                                req_id,
+                                if method_name == "session/set_model" {
+                                    json!({})
+                                } else {
+                                    json!({ "configOptions": options })
+                                },
+                            );
+                        }
+                        Err(error) => send_error(req_id, -32602, &error.to_string()),
+                    }
                 }
                 "session/prompt" => {
                     let params = match value.get("params") {
@@ -1370,6 +1515,96 @@ mod prompt_result_tests {
         });
 
         (state, parent)
+    }
+
+    #[gpui::test]
+    async fn thinking_effort_reaches_native_model_request(cx: &mut gpui::TestAppContext) {
+        use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
+        use language_model::{
+            LanguageModelEffortLevel, LanguageModelProviderId, LanguageModelProviderName,
+        };
+        let (state, acp_thread) = test_session(cx).await;
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().to_string());
+        let model = Arc::new(
+            FakeLanguageModel::with_id_and_thinking("fake", "effort", "Effort", true)
+                .with_effort_levels(vec![
+                    LanguageModelEffortLevel {
+                        name: "Low".into(),
+                        value: "low".into(),
+                        is_default: true,
+                    },
+                    LanguageModelEffortLevel {
+                        name: "High".into(),
+                        value: "high".into(),
+                        is_default: false,
+                    },
+                ]),
+        );
+        let provider = Arc::new(
+            FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("fake".to_owned()),
+                LanguageModelProviderName::from("Fake".to_owned()),
+            )
+            .with_models(vec![model.clone(), Arc::new(FakeLanguageModel::default())]),
+        );
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| registry.register_provider(provider, cx))
+        });
+        let mut async_cx = cx.to_async();
+        process_message(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "session/set_config_option", "params": {
+                "sessionId": session_id, "configId": "model", "value": "fake/effort",
+            }}),
+            state.clone(),
+            &mut async_cx,
+        )
+        .await;
+        for effort in ["high", "low"] {
+            process_message(json!({ "jsonrpc": "2.0", "id": 2, "method": "session/set_config_option", "params": {
+                "sessionId": session_id, "configId": "thinking_effort", "value": effort,
+            }}), state.clone(), &mut async_cx).await;
+            let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Hello".into()], cx));
+            let send = cx.foreground_executor().spawn(send);
+            cx.run_until_parked();
+            assert_eq!(
+                model
+                    .pending_completions()
+                    .last()
+                    .unwrap()
+                    .thinking_effort
+                    .as_deref(),
+                Some(effort)
+            );
+            model.send_last_completion_stream_text_chunk("Done.");
+            model.end_last_completion_stream();
+            send.await.unwrap();
+        }
+        process_message(
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option", "params": {
+                "sessionId": session_id, "configId": "thinking_effort", "value": "unsupported",
+            }}),
+            state.clone(),
+            &mut async_cx,
+        )
+        .await;
+        RPC_MESSAGES.with(|messages| {
+            assert_eq!(messages.borrow().last().unwrap()["error"]["code"], -32602)
+        });
+        process_message(
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "session/set_config_option", "params": {
+                "sessionId": session_id, "configId": "model", "value": "fake/fake",
+            }}),
+            state.clone(),
+            &mut async_cx,
+        )
+        .await;
+        RPC_MESSAGES.with(|messages| {
+            assert_eq!(
+                messages.borrow().last().unwrap()["result"]["configOptions"],
+                json!([])
+            )
+        });
     }
 
     #[gpui::test]
