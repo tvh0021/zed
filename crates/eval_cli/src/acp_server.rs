@@ -41,6 +41,7 @@ use headless::AgentCliAppState;
 #[derive(Parser, Debug)]
 #[command(
     name = "zed-acp-server",
+    version,
     about = "Headless Zed Agent Client Protocol (ACP) Server"
 )]
 struct Args {
@@ -897,7 +898,7 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                             "_meta": { "t3WorkerPolicy": state.borrow().worker_mode.clone(), "t3ThreadTools": true },
                             "serverInfo": {
                                 "name": "zed-acp-server",
-                                "version": "0.1.0"
+                                "version": env!("CARGO_PKG_VERSION")
                             },
                             "capabilities": {
                                 "elicitation": { "form": true },
