@@ -26,7 +26,9 @@ use clap::Parser;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Subscription, UpdateGlobal as _};
-use language_model::{ConfiguredModel, LanguageModelRegistry, SelectedModel};
+use language_model::{
+    ConfiguredModel, LanguageModel, LanguageModelId, LanguageModelRegistry, SelectedModel,
+};
 use project::Project;
 use release_channel::{AppCommitSha, AppVersion};
 use reqwest_client::ReqwestClient;
@@ -533,6 +535,30 @@ async fn ensure_model_ready(
     }
 }
 
+fn hosted_model_catalog(
+    models: &[Arc<dyn LanguageModel>],
+    default_model: Option<&LanguageModelId>,
+) -> Vec<Value> {
+    models
+        .iter()
+        // Zed rejects requests to disabled models, so listing them only fails turns.
+        .filter(|model| model.is_disabled().is_none())
+        .map(|model| {
+            json!({
+                "slug": format!("zed.dev/{}", model.id().0),
+                "name": model.name().0.to_string(),
+                "provider": model.upstream_provider_name().0.to_string(),
+                "isDefault": default_model == Some(&model.id()),
+                "effortLevels": model.supported_effort_levels().iter().map(|level| json!({
+                    "value": level.value.to_string(),
+                    "name": level.name.to_string(),
+                    "isDefault": level.is_default,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 fn effort_config_options(thread: &agent::Thread) -> Vec<Value> {
     let Some(model) = thread.model() else {
         return Vec::new();
@@ -593,23 +619,20 @@ fn main() {
                     app_state.client.sign_in_non_interactive(&cx).await?;
                     let started_at = Instant::now();
                     loop {
-                        let models = cx.update(|cx| {
+                        let (models, default_model) = cx.update(|cx| {
                             LanguageModelRegistry::global(cx)
                                 .read(cx)
                                 .provider(&language_model::ZED_CLOUD_PROVIDER_ID)
-                                .map(|provider| provider.provided_models(cx))
+                                .map(|provider| {
+                                    (
+                                        provider.provided_models(cx),
+                                        provider.default_model(cx).map(|model| model.id()),
+                                    )
+                                })
                                 .unwrap_or_default()
                         });
                         if !models.is_empty() {
-                            let models = models.iter().map(|model| json!({
-                                "slug": format!("zed.dev/{}", model.id().0),
-                                "name": model.name().0.to_string(),
-                                "effortLevels": model.supported_effort_levels().iter().map(|level| json!({
-                                    "value": level.value.to_string(),
-                                    "name": level.name.to_string(),
-                                    "isDefault": level.is_default,
-                                })).collect::<Vec<_>>(),
-                            })).collect::<Vec<_>>();
+                            let models = hosted_model_catalog(&models, default_model.as_ref());
                             println!("{}", serde_json::to_string(&models)?);
                             return Ok::<_, anyhow::Error>(());
                         }
@@ -1515,6 +1538,30 @@ mod prompt_result_tests {
         });
 
         (state, parent)
+    }
+
+    #[test]
+    fn hosted_model_catalog_marks_provider_and_default() {
+        use language_model::fake_provider::FakeLanguageModel;
+        let models: Vec<Arc<dyn LanguageModel>> = vec![
+            Arc::new(FakeLanguageModel::with_id_and_thinking(
+                "zed.dev", "first", "First", false,
+            )),
+            Arc::new(FakeLanguageModel::with_id_and_thinking(
+                "zed.dev", "second", "Second", false,
+            )),
+        ];
+        let default_model = LanguageModelId::from("second".to_string());
+        let catalog = hosted_model_catalog(&models, Some(&default_model));
+        assert_eq!(
+            catalog,
+            vec![
+                json!({ "slug": "zed.dev/first", "name": "First", "provider": "Fake",
+                    "isDefault": false, "effortLevels": [] }),
+                json!({ "slug": "zed.dev/second", "name": "Second", "provider": "Fake",
+                    "isDefault": true, "effortLevels": [] }),
+            ]
+        );
     }
 
     #[gpui::test]
