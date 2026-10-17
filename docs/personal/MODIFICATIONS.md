@@ -41,7 +41,10 @@ APIs rather than patching them back.
 
 ## Releases
 
-- 0.2.2 (2026-10-17): synced with upstream v1.24.2.
+- 0.2.2 (2026-10-17): synced with upstream v1.24.2. Release binaries are
+  signed with the "T3 Code Personal Local Signing" certificate under the
+  identifier `com.tvh0021.zed-acp-server`, so keychain access to the Zed
+  sign-in survives updates. Ad-hoc builds ask again after every rebuild.
 - 0.2.1 (2026-10-17): `--version`, and `initialize` reports the crate version.
 - 0.2.0 (2026-10-17): first tagged release. Merges the bridge into `main`;
   `integration/zed-abacus` is retired. Adds provider labels, the account
