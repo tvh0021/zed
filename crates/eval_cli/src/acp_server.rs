@@ -17,17 +17,18 @@ use std::time::{Duration, Instant};
 
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentConnection as _, AgentThreadEntry, AssistantMessageChunk,
-    ElicitationEntryId, PermissionOptions, SelectedPermissionOutcome, ToolCallStatus,
+    ElicitationEntryId, MessageIdentity, PermissionOptions, SelectedPermissionOutcome,
+    SubmissionResponse, ToolCallStatus,
 };
 use agent::{NativeAgent, NativeAgentConnection, Templates, ThreadStore};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
 use anyhow::Context as _;
 use clap::Parser;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Subscription, UpdateGlobal as _};
 use language_model::{
-    ConfiguredModel, LanguageModel, LanguageModelId, LanguageModelRegistry, SelectedModel,
+    LanguageModel, LanguageModelId, LanguageModelRegistry, SelectedModel,
 };
 use project::Project;
 use release_channel::{AppCommitSha, AppVersion};
@@ -109,18 +110,26 @@ fn send_error(id: &Value, code: i64, message: &str) {
     }));
 }
 
-fn prompt_result(outcome: anyhow::Result<Option<acp::PromptResponse>>) -> anyhow::Result<Value> {
+fn prompt_result(outcome: anyhow::Result<Option<SubmissionResponse>>) -> anyhow::Result<Value> {
     let stop_reason = match outcome {
-        Ok(Some(response)) => match response.stop_reason {
+        Ok(Some(SubmissionResponse::LegacyCompleted(response))) => match response.stop_reason {
             acp::StopReason::EndTurn => "end_turn",
             acp::StopReason::MaxTokens => "max_tokens",
             acp::StopReason::Cancelled => "cancelled",
             _ => "end_turn",
         },
-        Ok(None) => "end_turn",
+        // The native agent completes legacy submissions; a v2 receipt only acknowledges the prompt.
+        Ok(Some(SubmissionResponse::Accepted(_))) | Ok(None) => "end_turn",
         Err(error) => return Err(error),
     };
     Ok(json!({ "stopReason": stop_reason }))
+}
+
+fn message_id(identity: &MessageIdentity) -> Option<String> {
+    match identity {
+        MessageIdentity::Legacy(id) => id.as_ref().map(ToString::to_string),
+        MessageIdentity::Keyed(id) => Some(id.to_string()),
+    }
 }
 
 fn send_notification(method: &str, params: Value) {
@@ -204,7 +213,7 @@ impl ServerState {
             // the final tail never reaches ACP clients.
             AcpThreadEvent::NewEntry
             | AcpThreadEvent::EntryUpdated(_)
-            | AcpThreadEvent::Stopped(_) => {
+            | AcpThreadEvent::Stopped { .. } => {
                 let Some(session) = self.sessions.get_mut(session_id) else {
                     return;
                 };
@@ -223,7 +232,7 @@ impl ServerState {
                         {
                             for (chunk_ix, chunk) in msg.chunks.iter().enumerate() {
                                 match chunk {
-                                    AssistantMessageChunk::Message { block, id } => {
+                                    AssistantMessageChunk::Message { block, identity, .. } => {
                                         let markdown = block.to_markdown(cx);
                                         let emitted = session
                                             .emitted_chunk_lengths
@@ -238,7 +247,7 @@ impl ServerState {
                                                     "sessionId": client_session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_message_chunk",
-                                                        "messageId": id.as_ref().map(ToString::to_string),
+                                                        "messageId": message_id(identity),
                                                         "content": {
                                                             "type": "text",
                                                             "text": delta
@@ -248,7 +257,7 @@ impl ServerState {
                                             );
                                         }
                                     }
-                                    AssistantMessageChunk::Thought { block, id } => {
+                                    AssistantMessageChunk::Thought { block, identity, .. } => {
                                         let markdown = block.to_markdown(cx);
                                         let emitted = session
                                             .emitted_chunk_lengths
@@ -263,7 +272,7 @@ impl ServerState {
                                                     "sessionId": client_session_id,
                                                     "update": {
                                                         "sessionUpdate": "agent_thought_chunk",
-                                                        "messageId": id.as_ref().map(ToString::to_string),
+                                                        "messageId": message_id(identity),
                                                         "content": {
                                                             "type": "text",
                                                             "text": delta
@@ -277,9 +286,9 @@ impl ServerState {
                             }
                         }
                         AgentThreadEntry::ToolCall(call) => {
-                            let status_str = match &call.status {
+                            let status_str = match call.status() {
                                 ToolCallStatus::Pending => "pending",
-                                ToolCallStatus::WaitingForConfirmation { .. } => "pending",
+                                ToolCallStatus::WaitingForConfirmation => "pending",
                                 ToolCallStatus::InProgress => "in_progress",
                                 ToolCallStatus::Completed => "completed",
                                 ToolCallStatus::Failed => "failed",
@@ -287,16 +296,16 @@ impl ServerState {
                                 ToolCallStatus::Canceled => "failed",
                             };
 
-                            let kind_str = match call.kind {
-                                acp::ToolKind::Read => "read",
-                                acp::ToolKind::Edit => "edit",
-                                acp::ToolKind::Delete => "delete",
-                                acp::ToolKind::Move => "move",
-                                acp::ToolKind::Search => "search",
-                                acp::ToolKind::Execute => "execute",
-                                acp::ToolKind::Think => "think",
-                                acp::ToolKind::Fetch => "fetch",
-                                acp::ToolKind::SwitchMode => "switch_mode",
+                            let kind_str = match call.kind() {
+                                acp_v2::ToolKind::Read => "read",
+                                acp_v2::ToolKind::Edit => "edit",
+                                acp_v2::ToolKind::Delete => "delete",
+                                acp_v2::ToolKind::Move => "move",
+                                acp_v2::ToolKind::Search => "search",
+                                acp_v2::ToolKind::Execute => "execute",
+                                acp_v2::ToolKind::Think => "think",
+                                acp_v2::ToolKind::Fetch => "fetch",
+                                acp_v2::ToolKind::SwitchMode => "switch_mode",
                                 _ => "other",
                             };
 
@@ -308,7 +317,7 @@ impl ServerState {
                                 "rawInput": call.raw_input,
                                 "rawOutput": call.raw_output,
                                 "locations": call.locations,
-                                "content": call.content.iter().map(|content| json!({
+                                "content": call.content().iter().map(|content| json!({
                                     "type": "content",
                                     "content": { "type": "text", "text": content.to_markdown(cx) },
                                 })).collect::<Vec<_>>(),
@@ -345,15 +354,24 @@ impl ServerState {
                     }
                 }
             }
-            AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+            AcpThreadEvent::ToolAuthorizationRequested(request_id) => {
+                let thread_read = thread.read(cx);
+                // The native agent only raises tool-call permission requests.
+                let Some(request) = thread_read.permission_request(*request_id) else {
+                    return;
+                };
+                let (Some(tool_call_id), Some(options)) =
+                    (request.legacy_tool_call_id(), request.legacy_options())
+                else {
+                    return;
+                };
                 if self.pending_permissions.values().any(|pending| {
                     pending.session_id == session_id && &pending.tool_call_id == tool_call_id
                 }) {
                     return;
                 }
-                let thread_read = thread.read(cx);
                 if let Some((_, call)) = thread_read.tool_call(tool_call_id) {
-                    if let ToolCallStatus::WaitingForConfirmation { options, .. } = &call.status {
+                    {
                         let acp_options = match options {
                             PermissionOptions::Flat(opts) => opts.clone(),
                             PermissionOptions::Dropdown(choices) => choices
@@ -481,14 +499,13 @@ impl ServerState {
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn find_configured_model(selected: &SelectedModel, cx: &App) -> Option<ConfiguredModel> {
+fn find_configured_model(selected: &SelectedModel, cx: &App) -> Option<LanguageModel> {
     let registry = LanguageModelRegistry::global(cx);
     let provider = registry.read(cx).provider(&selected.provider)?;
-    let model = provider
+    provider
         .provided_models(cx)
         .into_iter()
-        .find(|model| model.id() == selected.model)?;
-    Some(ConfiguredModel { provider, model })
+        .find(|model| model.id == selected.model)
 }
 
 async fn ensure_model_ready(
@@ -537,7 +554,7 @@ async fn ensure_model_ready(
 }
 
 fn hosted_model_catalog(
-    models: &[Arc<dyn LanguageModel>],
+    models: &[LanguageModel],
     default_model: Option<&LanguageModelId>,
 ) -> Vec<Value> {
     models
@@ -846,11 +863,7 @@ fn attach_subagent(
                 .entries()
                 .iter()
                 .filter_map(|entry| match entry {
-                    AgentThreadEntry::ToolCall(call)
-                        if matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. }) =>
-                    {
-                        Some(call.id.clone())
-                    }
+                    AgentThreadEntry::ToolCall(call) => call.authorization_id(),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1139,7 +1152,7 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                                 .context("Model not available")?;
                             thread.update(cx, |thread, cx| {
                                 let previous = thread.thinking_effort().cloned();
-                                let levels = configured.model.supported_effort_levels();
+                                let levels = configured.supported_effort_levels();
                                 let effort = previous
                                     .filter(|value| {
                                         levels
@@ -1148,13 +1161,11 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                                     })
                                     .or_else(|| {
                                         configured
-                                            .model
                                             .default_effort_level()
                                             .map(|level| level.value.to_string())
                                     });
-                                thread
-                                    .set_thinking_enabled(configured.model.supports_thinking(), cx);
-                                thread.set_model(configured.model, cx);
+                                thread.set_thinking_enabled(configured.supports_thinking(), cx);
+                                thread.set_model(configured, cx);
                                 thread.set_thinking_effort(effort, cx);
                             });
                         } else {
@@ -1255,6 +1266,17 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                         )));
                     }
 
+                    let content_blocks = match content_blocks
+                        .into_iter()
+                        .map(acp_thread::content::from_v1)
+                        .collect::<anyhow::Result<Vec<_>>>()
+                    {
+                        Ok(blocks) => blocks,
+                        Err(error) => {
+                            send_error(req_id, -32602, &error.to_string());
+                            return;
+                        }
+                    };
                     let send_future =
                         acp_thread.update(cx, |thread, cx| thread.send(content_blocks, cx));
 
@@ -1343,6 +1365,17 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
                     let content_blocks =
                         vec![acp::ContentBlock::Text(acp::TextContent::new(command_text))];
 
+                    let content_blocks = match content_blocks
+                        .into_iter()
+                        .map(acp_thread::content::from_v1)
+                        .collect::<anyhow::Result<Vec<_>>>()
+                    {
+                        Ok(blocks) => blocks,
+                        Err(error) => {
+                            send_error(req_id, -32602, &error.to_string());
+                            return;
+                        }
+                    };
                     let send_future =
                         acp_thread.update(cx, |thread, cx| thread.send(content_blocks, cx));
 
@@ -1450,7 +1483,7 @@ async fn process_message(value: Value, state: Rc<RefCell<ServerState>>, cx: &mut
             if let Some(thread) = thread_opt {
                 if let Some(result_val) = value.get("result") {
                     if let Ok(response) =
-                        serde_json::from_value::<acp::CreateElicitationResponse>(result_val.clone())
+                        serde_json::from_value::<acp_v2::CreateElicitationResponse>(result_val.clone())
                     {
                         let _ = thread.update(cx, |t, cx| {
                             t.respond_to_elicitation(&pending.entry_id, response, cx);
@@ -1474,8 +1507,8 @@ mod prompt_result_tests {
 
     #[test]
     fn successful_prompt_preserves_stop_reason() {
-        let result = prompt_result(Ok(Some(acp::PromptResponse::new(
-            acp::StopReason::MaxTokens,
+        let result = prompt_result(Ok(Some(SubmissionResponse::LegacyCompleted(
+            acp::PromptResponse::new(acp::StopReason::MaxTokens),
         ))))
         .unwrap();
         assert_eq!(result, json!({ "stopReason": "max_tokens" }));
@@ -1543,15 +1576,17 @@ mod prompt_result_tests {
 
     #[test]
     fn hosted_model_catalog_marks_provider_and_default() {
-        use language_model::fake_provider::FakeLanguageModel;
-        let models: Vec<Arc<dyn LanguageModel>> = vec![
-            Arc::new(FakeLanguageModel::with_id_and_thinking(
-                "zed.dev", "first", "First", false,
-            )),
-            Arc::new(FakeLanguageModel::with_id_and_thinking(
-                "zed.dev", "second", "Second", false,
-            )),
-        ];
+        let model = |id: &str, name: &str| {
+            LanguageModel::new(
+                LanguageModelId::from(id.to_string()),
+                name.to_string().into(),
+                "zed.dev".to_string().into(),
+                "Fake".to_string().into(),
+                id.to_string(),
+                1_000_000,
+            )
+        };
+        let models = vec![model("first", "First"), model("second", "Second")];
         let default_model = LanguageModelId::from("second".to_string());
         let catalog = hosted_model_catalog(&models, Some(&default_model));
         assert_eq!(
@@ -1567,37 +1602,35 @@ mod prompt_result_tests {
 
     #[gpui::test]
     async fn thinking_effort_reaches_native_model_request(cx: &mut gpui::TestAppContext) {
-        use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
+        use language_model::fake_provider::FakeLanguageModelProvider;
         use language_model::{
             LanguageModelEffortLevel, LanguageModelProviderId, LanguageModelProviderName,
         };
         let (state, acp_thread) = test_session(cx).await;
         let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().to_string());
-        let model = Arc::new(
-            FakeLanguageModel::with_id_and_thinking("fake", "effort", "Effort", true)
-                .with_effort_levels(vec![
-                    LanguageModelEffortLevel {
-                        name: "Low".into(),
-                        value: "low".into(),
-                        is_default: true,
-                    },
-                    LanguageModelEffortLevel {
-                        name: "High".into(),
-                        value: "high".into(),
-                        is_default: false,
-                    },
-                ]),
-        );
-        let provider = Arc::new(
-            FakeLanguageModelProvider::new(
-                LanguageModelProviderId::from("fake".to_owned()),
-                LanguageModelProviderName::from("Fake".to_owned()),
-            )
-            .with_models(vec![model.clone(), Arc::new(FakeLanguageModel::default())]),
-        );
+        let provider = Arc::new(FakeLanguageModelProvider::new(
+            LanguageModelProviderId::from("fake".to_owned()),
+            LanguageModelProviderName::from("Fake".to_owned()),
+        ));
+        let model = provider.update_model("effort", |model| {
+            model.supports_thinking = true;
+            model.supported_effort_levels = vec![
+                LanguageModelEffortLevel {
+                    name: "Low".into(),
+                    value: "low".into(),
+                    is_default: true,
+                },
+                LanguageModelEffortLevel {
+                    name: "High".into(),
+                    value: "high".into(),
+                    is_default: false,
+                },
+            ]
+            .into();
+        });
         cx.update(|cx| {
             LanguageModelRegistry::global(cx)
-                .update(cx, |registry, cx| registry.register_provider(provider, cx))
+                .update(cx, |registry, cx| registry.register_provider(provider.clone(), cx))
         });
         let mut async_cx = cx.to_async();
         process_message(
@@ -1616,16 +1649,16 @@ mod prompt_result_tests {
             let send = cx.foreground_executor().spawn(send);
             cx.run_until_parked();
             assert_eq!(
-                model
-                    .pending_completions()
+                provider
+                    .pending_completions_for(&model)
                     .last()
                     .unwrap()
                     .thinking_effort
                     .as_deref(),
                 Some(effort)
             );
-            model.send_last_completion_stream_text_chunk("Done.");
-            model.end_last_completion_stream();
+            provider.send_last_text(&model, "Done.");
+            provider.end_last(&model);
             send.await.unwrap();
         }
         process_message(
